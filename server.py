@@ -1,202 +1,259 @@
-from flask import Flask, jsonify
+from flask import Flask, request, jsonify
+import os
+import base64
 import win32print
 import win32api
-import sys
-import logging
-
-# Configurar logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import time
+import json
 
 app = Flask(__name__)
 
-# Comando ESC/POS para abrir cajón (estándar para impresoras térmicas)
-OPEN_DRAWER_COMMAND = b'\x1B\x70\x00\x19\xFA'  # ESC p 0 25 250
+# Comandos ESC/POS estándar
+CUT_PAPER_COMMAND = b'\x1D\x56\x00'  # Comando de corte parcial
+OPEN_DRAWER_COMMAND = b'\x1B\x70\x00\x19\xFA'  # Comando para abrir cajón
 
-def get_default_printer():
-    """Obtiene la impresora por defecto del sistema"""
-    try:
-        return win32print.GetDefaultPrinter()
-    except Exception as e:
-        logger.error(f"Error obteniendo impresora por defecto: {e}")
-        return None
-
-def open_cash_drawer(printer_name=None):
-    """
-    Envía comando para abrir cajón portamonedas
-    """
-    try:
-        # Si no se especifica impresora, usar la por defecto
-        if not printer_name:
-            printer_name = get_default_printer()
-            if not printer_name:
-                return False, "No se pudo obtener la impresora por defecto"
-        
-        # Abrir conexión con la impresora
-        printer_handle = win32print.OpenPrinter(printer_name)
-        
-        # Configurar el trabajo de impresión
-        job_info = ("Abrir Cajon", None, "RAW")
-        job_id = win32print.StartDocPrinter(printer_handle, 1, job_info)
-        
-        # Iniciar página
-        win32print.StartPagePrinter(printer_handle)
-        
-        # Enviar comando para abrir cajón
-        win32print.WritePrinter(printer_handle, OPEN_DRAWER_COMMAND)
-        
-        # Finalizar página y documento
-        win32print.EndPagePrinter(printer_handle)
-        win32print.EndDocPrinter(printer_handle)
-        
-        # Cerrar conexión
-        win32print.ClosePrinter(printer_handle)
-        
-        logger.info(f"Comando enviado exitosamente a {printer_name}")
-        return True, "Cajón abierto exitosamente"
-        
-    except Exception as e:
-        error_msg = f"Error abriendo cajón: {str(e)}"
-        logger.error(error_msg)
-        return False, error_msg
-
-def list_printers():
-    """Lista todas las impresoras disponibles en el sistema"""
-    try:
-        printers = []
-        printer_enum = win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS)
-        for printer in printer_enum:
-            printers.append(printer[2])  # Nombre de la impresora
-        return printers
-    except Exception as e:
-        logger.error(f"Error listando impresoras: {e}")
-        return []
-
-@app.route('/')
-def home():
-    """Página principal con información"""
-    printers = list_printers()
-    default_printer = get_default_printer()
-    
-    html = f"""
-    <h1>Servidor Cajón Impresora Térmica</h1>
-    <p><strong>Impresora por defecto:</strong> {default_printer or 'No encontrada'}</p>
-    <h3>Endpoints disponibles:</h3>
-    <ul>
-        <li><a href="/open">/open</a> - Abrir cajón</li>
-        <li><a href="/status">/status</a> - Estado del sistema</li>
-        <li><a href="/printers">/printers</a> - Lista de impresoras</li>
-    </ul>
-    <h3>Impresoras disponibles:</h3>
-    <ul>
-    """
-    
-    for printer in printers:
-        html += f"<li>{printer}</li>"
-    
-    html += """
-    </ul>
-    <p><em>Servidor ejecutándose en http://127.0.0.1:5000</em></p>
-    """
-    
-    return html
-
-@app.route('/open')
 def open_drawer():
-    """Endpoint principal para abrir el cajón"""
+    """Abrir cajón conectado a la impresora"""
     try:
-        success, message = open_cash_drawer()
+        default_printer = win32print.GetDefaultPrinter()
+        print(f"Abriendo cajón en impresora: {default_printer}")
         
-        if success:
-            return jsonify({
-                'status': 'success',
-                'message': message
-            }), 200
-        else:
-            return jsonify({
-                'status': 'error',
-                'message': message
-            }), 500
+        hPrinter = win32print.OpenPrinter(default_printer)
+        try:
+            hJob = win32print.StartDocPrinter(hPrinter, 1, ("Abrir Cajon", None, "RAW"))
+            win32print.StartPagePrinter(hPrinter)
+            win32print.WritePrinter(hPrinter, OPEN_DRAWER_COMMAND)
+            win32print.EndPagePrinter(hPrinter)
+            win32print.EndDocPrinter(hPrinter)
+            print("✓ Comando de apertura enviado correctamente")
+            return True
+        finally:
+            win32print.ClosePrinter(hPrinter)
+    except Exception as e:
+        print(f"✗ Error al abrir cajón: {e}")
+        return False
+
+def cut_paper():
+    """Enviar comando de corte de papel a la impresora"""
+    try:
+        default_printer = win32print.GetDefaultPrinter()
+        print(f"Enviando comando de corte a: {default_printer}")
+        
+        hPrinter = win32print.OpenPrinter(default_printer)
+        try:
+            hJob = win32print.StartDocPrinter(hPrinter, 1, ("Corte Papel", None, "RAW"))
+            win32print.StartPagePrinter(hPrinter)
+            win32print.WritePrinter(hPrinter, CUT_PAPER_COMMAND)
+            win32print.EndPagePrinter(hPrinter)
+            win32print.EndDocPrinter(hPrinter)
+            print("✓ Comando de corte enviado correctamente")
+            return True
+        finally:
+            win32print.ClosePrinter(hPrinter)
+    except Exception as e:
+        print(f"✗ Error al cortar papel: {e}")
+        return False
+
+def print_text_ticket(text_content, cut_after=True):
+    """Imprimir ticket de texto plano en la impresora por defecto"""
+    try:
+        default_printer = win32print.GetDefaultPrinter()
+        print(f"Imprimiendo en: {default_printer}")
+        
+        hPrinter = win32print.OpenPrinter(default_printer)
+        try:
+            hJob = win32print.StartDocPrinter(hPrinter, 1, ("Ticket", None, "RAW"))
+            win32print.StartPagePrinter(hPrinter)
             
+            # Codificar texto para impresora
+            try:
+                data = text_content.encode('cp850')
+            except UnicodeEncodeError:
+                data = text_content.encode('utf-8', errors='replace')
+            
+            # Enviar datos a la impresora
+            win32print.WritePrinter(hPrinter, data)
+            
+            # Enviar comando de corte si está habilitado
+            if cut_after:
+                win32print.WritePrinter(hPrinter, CUT_PAPER_COMMAND)
+                print("✓ Comando de corte enviado después de imprimir")
+            
+            win32print.EndPagePrinter(hPrinter)
+            win32print.EndDocPrinter(hPrinter)
+            print("✓ Ticket impreso correctamente")
+            return True
+        finally:
+            win32print.ClosePrinter(hPrinter)
+    except Exception as e:
+        print(f"✗ Error al imprimir ticket: {e}")
+        return False
+    
+def add_cors_headers(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+    
+@app.after_request
+def after_request(response):
+    return add_cors_headers(response)
+
+# Manejar peticiones OPTIONS
+@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+@app.route('/<path:path>', methods=['OPTIONS'])
+def handle_options(path):
+    response = jsonify({'status': 'OK'})
+    return add_cors_headers(response)
+
+
+def print_pdf_file(pdf_path):
+    """Imprimir un archivo PDF en la impresora por defecto de Windows"""
+    try:
+        default_printer = win32print.GetDefaultPrinter()
+        print(f"Usando impresora por defecto: {default_printer}")
+        win32api.ShellExecute(
+            0, "printto", pdf_path, f'"{default_printer}"', ".", 0
+        )
+        print(f"Archivo PDF '{pdf_path}' enviado a la impresora '{default_printer}'")
+        return True
+    except Exception as e:
+        print(f"Error al imprimir el PDF: {e}")
+        return False
+
+def save_and_print_pdf(base64_pdf_data):
+    """Guardar el PDF desde base64 e imprimirlo"""
+    try:
+        output_dir = os.path.join(os.path.expanduser("~"), "PrintedPDFs")
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        pdf_path = os.path.join(output_dir, f"ticket_{timestamp}.pdf")
+        
+        pdf_bytes = base64.b64decode(base64_pdf_data)
+        with open(pdf_path, 'wb') as f:
+            f.write(pdf_bytes)
+        print(f"PDF guardado en: {pdf_path}")
+        
+        if not os.path.exists(pdf_path):
+            print("Error: No se pudo crear el archivo PDF")
+            return False
+        
+        result = print_pdf_file(pdf_path)
+        return result
+    except Exception as e:
+        print(f"Error en el proceso de guardado e impresión: {e}")
+        return False
+
+@app.route('/open_drawer', methods=['POST'])
+def open_cash_drawer():
+    """Endpoint para abrir el cajón de la impresora"""
+    try:
+        success = open_drawer()
+        if success:
+            return jsonify({'status': 'success', 'message': 'Cajón abierto correctamente'}), 200
+        else:
+            return jsonify({'status': 'error', 'message': 'Error al abrir el cajón'}), 500
+    except Exception as e:
+        print(f"Error en el endpoint /open_drawer: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/cut_paper', methods=['POST'])
+def cut_paper_endpoint():
+    """Endpoint para cortar el papel"""
+    try:
+        success = cut_paper()
+        if success:
+            return jsonify({'status': 'success', 'message': 'Papel cortado correctamente'}), 200
+        else:
+            return jsonify({'status': 'error', 'message': 'Error al cortar el papel'}), 500
+    except Exception as e:
+        print(f"Error en el endpoint /cut_paper: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/print_text', methods=['POST'])
+def print_text_ticket_endpoint():
+    """Endpoint para imprimir tickets de texto"""
+    try:
+        data = request.get_json()
+        if not data or 'text' not in data:
+            return jsonify({'error': 'No se encontró el texto a imprimir'}), 400
+        
+        text_content = data['text']
+        cut_after = data.get('cut_after', True)  # Por defecto corta después de imprimir
+        print(f"Texto recibido, tamaño: {len(text_content)} caracteres")
+        print(f"Corte después de imprimir: {cut_after}")
+        
+        success = print_text_ticket(text_content, cut_after)
+        if success:
+            return jsonify({'status': 'success', 'message': 'Ticket impreso correctamente'}), 200
+        else:
+            return jsonify({'status': 'error', 'message': 'Error al imprimir el ticket'}), 500
+    except Exception as e:
+        print(f"Error en el endpoint /print_text: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/print', methods=['POST'])
+def print_ticket():
+    """Endpoint para recibir y imprimir tickets PDF"""
+    try:
+        data = request.get_json()
+        if not data or 'pdf_data' not in data:
+            return jsonify({'error': 'No se encontraron datos PDF'}), 400
+        
+        base64_pdf = data['pdf_data']
+        timestamp = data.get('timestamp', time.time())
+        print(f"PDF recibido, tamaño en base64: {len(base64_pdf)} caracteres")
+        print(f"Timestamp: {timestamp}")
+        
+        success = save_and_print_pdf(base64_pdf)
+        if success:
+            print("✓ PDF impreso correctamente")
+            return jsonify({'status': 'success', 'message': 'PDF impreso correctamente'}), 200
+        else:
+            print("✗ Error al imprimir el PDF")
+            return jsonify({'status': 'error', 'message': 'Error al imprimir el PDF'}), 500
+    except Exception as e:
+        print(f"Error en el endpoint /print: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/status', methods=['GET'])
+def server_status():
+    """Endpoint para verificar el estado del servidor"""
+    try:
+        default_printer = win32print.GetDefaultPrinter()
+        return jsonify({
+            'status': 'online',
+            'default_printer': default_printer,
+            'message': 'Servidor de impresión funcionando correctamente'
+        }), 200
     except Exception as e:
         return jsonify({
             'status': 'error',
-            'message': f'Error inesperado: {str(e)}'
+            'message': f'Error: {str(e)}'
         }), 500
 
-@app.route('/open/<printer_name>')
-def open_drawer_specific(printer_name):
-    """Abrir cajón en impresora específica"""
-    try:
-        success, message = open_cash_drawer(printer_name)
-        
-        if success:
-            return jsonify({
-                'status': 'success',
-                'message': message,
-                'printer': printer_name
-            }), 200
-        else:
-            return jsonify({
-                'status': 'error',
-                'message': message,
-                'printer': printer_name
-            }), 500
-            
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': f'Error inesperado: {str(e)}',
-            'printer': printer_name
-        }), 500
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Endpoint no encontrado'}), 404
 
-@app.route('/status')
-def status():
-    """Estado del sistema y conexión con impresoras"""
-    default_printer = get_default_printer()
-    printers = list_printers()
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'Error interno del servidor'}), 500
+
+if __name__ == "__main__":
+    print("Iniciando servidor de impresión...")
+    print("Endpoints disponibles:")
+    print("  POST /open_drawer - Abrir cajón de la impresora")
+    print("  POST /cut_paper - Cortar papel")
+    print("  POST /print_text - Imprimir ticket de texto")
+    print("  POST /print - Imprimir ticket PDF")
+    print("  GET /status - Estado del servidor")
     
-    return jsonify({
-        'status': 'running',
-        'default_printer': default_printer,
-        'available_printers': printers,
-        'total_printers': len(printers)
-    })
-
-@app.route('/printers')
-def printers():
-    """Lista todas las impresoras disponibles"""
-    printers_list = list_printers()
-    
-    return jsonify({
-        'printers': printers_list,
-        'count': len(printers_list),
-        'default': get_default_printer()
-    })
-
-@app.route('/test')
-def test():
-    """Endpoint de prueba simple"""
-    return jsonify({
-        'status': 'ok',
-        'message': 'Servidor funcionando correctamente'
-    })
-
-if __name__ == '__main__':
-    print("=" * 50)
-    print("SERVIDOR CAJÓN IMPRESORA TÉRMICA")
-    print("=" * 50)
-    print(f"Impresora por defecto: {get_default_printer()}")
-    print(f"Impresoras disponibles: {len(list_printers())}")
-    print("\nEndpoints disponibles:")
-    print("- http://127.0.0.1:5000/open (Abrir cajón)")
-    print("- http://127.0.0.1:5000/status (Estado)")
-    print("- http://127.0.0.1:5000/printers (Lista impresoras)")
-    print("=" * 50)
-    
-    # Ejecutar servidor
     app.run(
-        host='127.0.0.1',
-        port=5000,
-        debug=True
+        host='0.0.0.0',
+        port=12345,
+        debug=True,
+        threaded=True
     )
