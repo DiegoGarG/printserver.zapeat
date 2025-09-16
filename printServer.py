@@ -71,25 +71,155 @@ def print_raw(data: bytes) -> bool:
         return False
 
 
-def build_escpos_from_text(text: str, cut_after: bool = True, encoding: str = 'cp1252') -> bytes:
-    """Construir bytes ESC/POS a partir de texto plano.
-
-    - Quitar líneas en blanco al principio/fin para evitar espacios superiores/inferiores.
-    - Inicializar impresora (ESC @) y ajustar espaciado de líneas (ESC 3 n).
-    - Añadir corte si se solicita.
-
-    encoding: por defecto 'cp1252' (latin-1/windows-1252) que funciona bien para español. Si su impresora usa otra codepage, cámbiela.
+def safe_encode_text(text: str) -> bytes:
+    """Codificar texto de manera segura para impresoras térmicas.
+    Intenta múltiples codificaciones y reemplaza caracteres problemáticos.
     """
+    if text is None:
+        text = ""
+    
+    # Reemplazar caracteres problemáticos comunes
+    char_replacements = {
+        'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u',
+        'Á': 'A', 'É': 'E', 'Í': 'I', 'Ó': 'O', 'Ú': 'U',
+        'ñ': 'n', 'Ñ': 'N',
+        'ü': 'u', 'Ü': 'U',
+        '€': 'EUR',
+        '°': 'º',
+        '¿': '?',
+        '¡': '!',
+        '"': '"', '"': '"',
+        ''': "'", ''': "'",
+        '–': '-', '—': '-',
+        '…': '...',
+    }
+    
+    # Aplicar reemplazos
+    for original, replacement in char_replacements.items():
+        text = text.replace(original, replacement)
+    
+    # Lista de codificaciones a probar en orden de preferencia
+    encodings_to_try = [
+        'cp850',    # Code page 850 (Latin-1 con caracteres de caja)
+        'cp437',    # Code page 437 (ASCII extendido)
+        'iso-8859-1',  # Latin-1
+        'cp1252',   # Windows-1252
+        'ascii',    # ASCII puro (último recurso)
+    ]
+    
+    for encoding in encodings_to_try:
+        try:
+            encoded = text.encode(encoding, errors='replace')
+            print(f"✓ Texto codificado exitosamente con {encoding}")
+            return encoded
+        except Exception as e:
+            print(f"✗ Fallo codificación {encoding}: {e}")
+            continue
+    
+    # Si todas las codificaciones fallan, usar ASCII con reemplazo agresivo
+    print("⚠️ Usando codificación ASCII con reemplazo de caracteres")
+    return text.encode('ascii', errors='replace')
+
+
+def create_qr_raster_data(qr_base64: str, target_width_mm: int = 35) -> bytes:
+    """Convertir imagen QR en base64 a datos raster ESC/POS con tamaño exacto de 35mm x 35mm."""
+    try:
+        # Decodificar imagen base64
+        qr_bytes = base64.b64decode(qr_base64)
+        qr_img = Image.open(io.BytesIO(qr_bytes))
+        
+        print(f"QR original: {qr_img.size[0]}x{qr_img.size[1]} pixels")
+        
+        # Convertir a escala de grises
+        gray = qr_img.convert('L')
+        
+        # Cálculo preciso para 35mm en impresoras térmicas
+        # La mayoría de impresoras térmicas POS tienen ~203 DPI (8 dots per mm)
+        # 35mm = 35 * 8 = 280 pixels aproximadamente
+        # Usar múltiplo de 8 para facilitar el procesamiento raster
+        target_pixels = 280  # 35mm * 8 dots/mm = exactamente 35mm
+        
+        print(f"Redimensionando QR a {target_pixels}x{target_pixels} pixels (35mm x 35mm)")
+        
+        # Redimensionar manteniendo aspecto cuadrado y usando NEAREST para mantener definición
+        gray = gray.resize((target_pixels, target_pixels), Image.Resampling.NEAREST)
+        
+        # Binarizar con threshold optimizado para QR
+        threshold = 128
+        bw = gray.point(lambda x: 0 if x < threshold else 255, '1')
+        
+        # Verificar que el ancho sea múltiplo de 8 (requisito ESC/POS)
+        w, h = bw.size
+        width_bytes = (w + 7) // 8
+        padded_w = width_bytes * 8
+        
+        print(f"Dimensiones finales: {w}x{h} pixels, {width_bytes} bytes por línea")
+        
+        if padded_w != w:
+            print(f"Añadiendo padding: {padded_w - w} pixels")
+            new = Image.new('1', (padded_w, h), 1)  # fondo blanco
+            new.paste(bw, (0, 0))
+            bw = new
+            w = padded_w
+        
+        # Convertir a datos raster ESC/POS
+        pixels = bw.load()
+        raster_data = bytearray()
+        
+        for y in range(h):
+            for xb in range(width_bytes):
+                byte = 0
+                for bit in range(8):
+                    x = xb * 8 + bit
+                    if x < w:
+                        pixel = pixels[x, y]
+                        # En modo '1', pixel == 0 => negro, pixel == 255 => blanco
+                        # Para ESC/POS: 1 = negro, 0 = blanco
+                        bit_val = 1 if pixel == 0 else 0
+                    else:
+                        bit_val = 0  # padding blanco
+                    byte = (byte << 1) | bit_val
+                raster_data.append(byte)
+        
+        # Crear comando ESC/POS raster: GS v 0 m xL xH yL yH
+        GS = b'\x1D'
+        m = 0  # modo normal
+        xL = width_bytes & 0xFF
+        xH = (width_bytes >> 8) & 0xFF
+        yL = h & 0xFF
+        yH = (h >> 8) & 0xFF
+        
+        header = GS + b'v' + b'0' + bytes([m, xL, xH, yL, yH])
+        
+        print(f"Header ESC/POS: GS v 0 {m} {xL} {xH} {yL} {yH}")
+        print(f"Datos raster generados: {len(raster_data)} bytes")
+        
+        return header + raster_data
+    
+    except Exception as e:
+        print(f"✗ Error procesando QR: {e}")
+        import traceback
+        traceback.print_exc()
+        return b''
+
+
+def build_escpos_from_text(text: str, cut_after: bool = True, qr_base64: str = '') -> bytes:
+    """Construir bytes ESC/POS a partir de texto plano con codificación segura y QR opcional."""
+    
     # Normalizar saltos de línea y eliminar espacios iniciales/finales
     if text is None:
         text = ""
+    
     # Reemplazar CRLF por LF
     text = text.replace('\r\n', '\n').replace('\r', '\n')
+    
     # Strip for leading/trailing blank lines
     lines = [line.rstrip() for line in text.split('\n')]
+    
     # Remove leading blank lines
     while len(lines) and lines[0].strip() == '':
         lines.pop(0)
+    
     # Remove trailing blank lines
     while len(lines) and lines[-1].strip() == '':
         lines.pop()
@@ -100,26 +230,46 @@ def build_escpos_from_text(text: str, cut_after: bool = True, encoding: str = 'c
     ESC = b'\x1B'
     GS = b'\x1D'
     init = ESC + b'@'  # Inicializar impresora
-    # Reducir espaciado de líneas (n en puntos). 24 es razonable; bajar si necesita líneas más juntas.
+    # Reducir espaciado de líneas
     set_line_spacing = ESC + b'3' + bytes([24])
-
-    # Asegurar que haya al menos una nueva línea al final para imprimir la última línea
-    if not body_text.endswith('\n'):
-        body_text += '\n'
-
-    try:
-        body_bytes = body_text.encode(encoding, errors='replace')
-    except Exception:
-        body_bytes = body_text.encode('latin-1', errors='replace')
+    # Comando para centrar
+    center_align = ESC + b'a' + b'\x01'
+    # Comando para alineación izquierda
+    left_align = ESC + b'a' + b'\x00'
 
     out = bytearray()
     out += init
     out += set_line_spacing
+
+    # Si hay QR, imprimirlo primero centrado
+    if qr_base64:
+        qr_raster = create_qr_raster_data(qr_base64)
+        if qr_raster:
+            # Centrar y imprimir QR
+            out += center_align
+            out += safe_encode_text("QR Tributario:\n")
+            out += ESC + b'd' + bytes([1])  
+            out += qr_raster
+            out += safe_encode_text("\nVERI*FACTU\n")
+            out += ESC + b'd' + bytes([3])  # Espaciado después del QR
+            # Volver a alineación izquierda
+            out += left_align
+
+    # Asegurar que haya al menos una nueva línea al final
+    if not body_text.endswith('\n'):
+        body_text += '\n'
+
+    # Codificar de manera segura
+    try:
+        body_bytes = safe_encode_text(body_text)
+    except Exception as e:
+        print(f"✗ Error en codificación segura: {e}")
+        body_bytes = body_text.encode('ascii', errors='replace')
+
     out += body_bytes
 
-    # MEJORA: Añadir más avance de papel antes del corte para evitar que se corte la última línea
-    # Aumentado de 2 a 6 líneas de avance para asegurar que el texto se imprima completamente
-    out += ESC + b'd' + bytes([-12])  # ESC d n -> avanzar n líneas
+    # Añadir avance de papel antes del corte
+    out += ESC + b'd' + bytes([16])  # ESC d n -> avanzar n líneas
 
     if cut_after:
         out += CUT_PAPER_COMMAND
@@ -129,16 +279,18 @@ def build_escpos_from_text(text: str, cut_after: bool = True, encoding: str = 'c
 
 # --- Función de impresión de texto que evita márgenes ---
 
-def print_text_ticket(text: str, cut_after: bool = True) -> bool:
-    """Construir y enviar un ticket de texto a la impresora en RAW (ESC/POS).
-
-    Esto evita márgenes superiores/ inferiores generados por el driver porque no usamos un documento de página.
-    """
+def print_text_ticket(text: str, cut_after: bool = True, qr_base64: str = '') -> bool:
+    """Construir y enviar un ticket de texto a la impresora en RAW (ESC/POS) con QR opcional."""
     try:
-        data = build_escpos_from_text(text, cut_after=cut_after)
+        print(f"📝 Preparando impresión de texto ({len(text)} caracteres)")
+        if qr_base64:
+            print(f"🖼️ Incluyendo QR ({len(qr_base64)} caracteres base64)")
+        
+        data = build_escpos_from_text(text, cut_after=cut_after, qr_base64=qr_base64)
+        print(f"📤 Enviando {len(data)} bytes a impresora")
         return print_raw(data)
     except Exception as e:
-        print(f"Error en print_text_ticket: {e}")
+        print(f"✗ Error en print_text_ticket: {e}")
         return False
 
 
@@ -162,21 +314,8 @@ def cut_paper():
         return False
 
 
-# --- NOTA SOBRE PDFs ---
-# Imprimir PDF con Windows normalmente añade márgenes porque Windows trata PDF como documento de página.
-# La solución robusta para impresoras térmicas POS es generar ESC/POS directamente o rasterizar a imagen y enviar
-# como imagen raster con GS v 0 (imágenes de bits). Eso requiere bibliotecas externas (Pillow, pdf2image) y
-# puede aumentar la complejidad. Aquí dejamos un fallback que intenta usar ShellExecute cuando el usuario
-# realmente tiene que imprimir un PDF, pero recomendamos enviar texto/ESC-POS para evitar márgenes.
-
-
 def print_pdf_file(pdf_path: str) -> bool:
-    """Convertir cada página del PDF a imagen y enviarla como ESC/POS raster (GS v 0).
-
-    Esta implementación reemplaza el fallback que usaba ShellExecute y evita que Windows
-    aplique márgenes/paginación al imprimir PDFs. Convierte cada página a una imagen
-    con PyMuPDF, la binariza y genera el comando raster ESC/POS para enviarlo en RAW.
-    """
+    """Convertir cada página del PDF a imagen y enviarla como ESC/POS raster (GS v 0)."""
     try:
         doc = fitz.open(pdf_path)
         for p in range(len(doc)):
@@ -278,10 +417,24 @@ def print_text_ticket_endpoint():
         if not data or 'text' not in data:
             return jsonify({'error': 'No se encontró el texto a imprimir'}), 400
 
+        print(f"📥 Recibida petición de impresión de texto")
+        print(f"📝 Longitud del texto: {len(data['text'])} caracteres")
+        
+        # Obtener QR si está presente
+        qr_base64 = data.get('qr_data', '')
+        if qr_base64:
+            print(f"🖼️ QR recibido ({len(qr_base64)} caracteres)")
+        
+        # Debug: mostrar primeras líneas del texto
+        lines = data['text'].split('\n')[:5]
+        for i, line in enumerate(lines):
+            print(f"   Línea {i+1}: '{line}'")
+
         job_success = add_print_job({
             'type': 'text',
             'text': data['text'],
-            'cut_after': data.get('cut_after', True)
+            'cut_after': data.get('cut_after', True),
+            'qr_data': qr_base64
         })
 
         if job_success:
@@ -295,10 +448,7 @@ def print_text_ticket_endpoint():
 
 @app.route('/print', methods=['POST'])
 def print_ticket():
-    """Endpoint para recibir y (opcionalmente) imprimir PDFs.
-
-    Recomendación: para evitar márgenes, envíe tickets por /print_text en lugar de PDF.
-    """
+    """Endpoint para recibir y (opcionalmente) imprimir PDFs."""
     try:
         data = request.get_json()
         if not data or 'pdf_data' not in data:
@@ -356,6 +506,53 @@ def clear_queue_endpoint():
         else:
             return jsonify({'status': 'error', 'message': 'Error al limpiar cola'}), 500
     except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/test_print', methods=['POST'])
+def test_print_endpoint():
+    """Endpoint de prueba para verificar codificación."""
+    test_text = """========================================
+           TICKET DE PRUEBA
+========================================
+
+Restaurante Ejemplo
+Calle Principal 123
+CIF: B12345678
+----------------------------------------
+Fecha: 16/09/2025        Hora: 14:30
+Ticket: TEST001
+----------------------------------------
+DESCRIPCION          CANT   PRECIO    TOTAL
+----------------------------------------
+Hamburguesa            x1     8.50     8.50
+Patatas Fritas         x1     3.00     3.00
+Coca Cola              x2     2.50     5.00
+----------------------------------------
+Base Imponible                      15.00
+IVA (10%)                            1.50
+----------------------------------------
+TOTAL                               16.50
+========================================
+
+        Gracias por su visita
+     Este ticket es su comprobante
+              de compra
+"""
+    
+    try:
+        job_success = add_print_job({
+            'type': 'text',
+            'text': test_text,
+            'cut_after': True
+        })
+
+        if job_success:
+            return jsonify({'status': 'success', 'message': 'Ticket de prueba añadido a cola'}), 200
+        else:
+            return jsonify({'status': 'error', 'message': 'Error al añadir ticket de prueba'}), 500
+    except Exception as e:
+        print(f"Error en /test_print: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
@@ -439,7 +636,11 @@ def process_print_queue():
                 if job_type == 'pdf':
                     success = print_pdf_file(job['path'])
                 elif job_type == 'text':
-                    success = print_text_ticket(job['text'], job.get('cut_after', True))
+                    success = print_text_ticket(
+                        job['text'], 
+                        job.get('cut_after', True),
+                        job.get('qr_data', '')
+                    )
                 elif job_type == 'drawer':
                     success = open_drawer()
                 elif job_type == 'cut':
