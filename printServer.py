@@ -7,12 +7,18 @@ import time
 import json
 import threading
 import queue
+import argparse
+import sys
 
 import fitz  # PyMuPDF (pip install pymupdf)
 from PIL import Image
 import io
 
 app = Flask(__name__)
+#python servidor_impresion.py --origin https://testapp.zapeat.es --port 5000
+
+# Variable global para la URL permitida en CORS
+ALLOWED_ORIGIN = 'https://app.zapeat.es'  # Valor por defecto
 
 # Comandos ESC/POS estándar
 CUT_PAPER_COMMAND = b'\x1D\x56\x00'  # Corte parcial
@@ -25,10 +31,19 @@ print_lock = threading.Lock()
 
 
 def add_cors_headers(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Origin', ALLOWED_ORIGIN)
     response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    # NUEVO: Header requerido para peticiones a redes privadas
+    response.headers.add('Access-Control-Allow-Private-Network', 'true')
     return response
+
+# También agregar el manejo explícito de OPTIONS
+@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+@app.route('/<path:path>', methods=['OPTIONS'])
+def handle_preflight(path=''):
+    response = jsonify({'status': 'preflight ok'})
+    return add_cors_headers(response)
 
 @app.after_request
 def after_request(response):
@@ -491,6 +506,7 @@ def server_status():
         return jsonify({
             'status': 'online',
             'default_printer': default_printer,
+            'allowed_origin': ALLOWED_ORIGIN,
             'message': 'Servidor de impresión funcionando correctamente (modo RAW para tickets)'
         }), 200
     except Exception as e:
@@ -695,10 +711,68 @@ def add_print_job(job_data):
             return False
 
 
+def parse_arguments():
+    """Parsear argumentos de línea de comandos."""
+    parser = argparse.ArgumentParser(description='Servidor de impresión con CORS configurable')
+    parser.add_argument('--origin', '-o', 
+                        type=str,
+                        default='https://app.zapeat.es',
+                        help='URL permitida para CORS (Access-Control-Allow-Origin). Ejemplo: https://miapp.com')
+    parser.add_argument('--port', '-p',
+                        type=int,
+                        default=5000,
+                        help='Puerto del servidor (default: 5000)')
+    parser.add_argument('--host', 
+                        type=str,
+                        default='0.0.0.0',
+                        help='Host del servidor (default: 0.0.0.0)')
+    
+    return parser.parse_args()
+
+
+def set_allowed_origin(origin_url):
+    """Establecer la URL permitida para CORS."""
+    global ALLOWED_ORIGIN
+    ALLOWED_ORIGIN = origin_url
+    print(f"✓ Access-Control-Allow-Origin configurado a: {ALLOWED_ORIGIN}")
+
+
 from waitress import serve
 
 if __name__ == "__main__":
+    print("=" * 60)
+    print("    SERVIDOR DE IMPRESIÓN CON CORS CONFIGURABLE")
+    print("=" * 60)
+    
+    # Parsear argumentos de línea de comandos
+    args = parse_arguments()
+    
+    # Configurar la URL permitida para CORS
+    set_allowed_origin(args.origin)
+    
+    print(f"🌐 Origen permitido (CORS): {ALLOWED_ORIGIN}")
+    print(f"🖥️  Host: {args.host}")
+    print(f"🔌 Puerto: {args.port}")
+    print()
+    
     print("Iniciando servidor de impresión en modo RAW para tickets...")
     clear_print_queue()
     start_print_worker()
-    serve(app, host='0.0.0.0', port=5000)
+    
+    print("✓ Servidor iniciado correctamente")
+    print()
+    print("Ejemplos de uso:")
+    print(f"  python {sys.argv[0]} --origin https://miapp.com --port 5000")
+    print(f"  python {sys.argv[0]} -o https://localhost:3000 -p 8080")
+    print()
+    print("Presiona Ctrl+C para detener el servidor")
+    print("=" * 60)
+    
+    try:
+        serve(app, host=args.host, port=args.port)
+    except KeyboardInterrupt:
+        print("\n🛑 Servidor detenido por el usuario")
+        print("¡Hasta luego!")
+    except Exception as e:
+        print(f"\n❌ Error al iniciar el servidor: {e}")
+        sys.exit(1)
